@@ -1,0 +1,72 @@
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -4420,16 +4420,65 @@
+         return;
+ 
+     rect = menu->items_rect;
+-    /* Nothing to do if the menu height is non-zero or the items_rect is empty */
+-    if (menu->Height || IsRectEmpty( &rect ))
++    /* Nothing to do if the menu height is non-zero */
++    if (menu->Height)
+     {
+         release_menu_ptr( menu );
+         return;
+     }
+ 
+     release_menu_ptr( menu );
+-    /* A menu bar with zero height but non-empty items_rect needs updating */
+-    update_menu_bar_layout( hwnd, rect.right - rect.left, rect.left, rect.top );
++
++    if (!IsRectEmpty( &rect ))
++    {
++        /* A menu bar with zero height but non-empty items_rect needs updating */
++        TRACE( "rebuilding menu layout from item rect %s\n", wine_dbgstr_rect( &rect ) );
++        update_menu_bar_layout( hwnd, rect.right - rect.left, rect.left, rect.top );
++    }
++    else
++    {
++        LONG style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
++        LONG exstyle = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
++        INT width = 0, height = 0;
++
++        /* Some applications replace every item during WM_INITMENU, leaving
++         * items_rect empty. Recalculate using the window frame, as in the
++         * historical Reason 5 menu fix. */
++        if (!NtUserGetWindowRect( hwnd, &rect )) return;
++        SetRect( &rect, 0, 0, rect.right - rect.left, 0 );
++        rect.top = NtUserGetSystemMetrics( SM_CYCAPTION );
++
++        if (style & WS_THICKFRAME)
++        {
++            width += NtUserGetSystemMetrics( SM_CXFRAME ) - NtUserGetSystemMetrics( SM_CXDLGFRAME );
++            height += NtUserGetSystemMetrics( SM_CYFRAME ) - NtUserGetSystemMetrics( SM_CYDLGFRAME );
++        }
++
++        if ((style & (WS_BORDER | WS_DLGFRAME)) || (exstyle & WS_EX_DLGMODALFRAME))
++        {
++            width += NtUserGetSystemMetrics( SM_CXDLGFRAME ) - NtUserGetSystemMetrics( SM_CXEDGE );
++            height += NtUserGetSystemMetrics( SM_CYDLGFRAME ) - NtUserGetSystemMetrics( SM_CYEDGE );
++        }
++
++        if ((style & WS_THICKFRAME) && !((style & (WS_DLGFRAME | WS_BORDER)) == WS_DLGFRAME))
++        {
++            width++;
++            height++;
++        }
++
++        if ((style & (WS_THICKFRAME | WS_DLGFRAME)) || (exstyle & WS_EX_DLGMODALFRAME))
++        {
++            width++;
++            height++;
++        }
++
++        rect.left += width;
++        rect.right -= width;
++        rect.top += height;
++        rect.bottom = rect.top + NtUserGetSystemMetrics( SM_CYMENU );
++        TRACE( "rebuilding menu layout from window frame %s\n", wine_dbgstr_rect( &rect ) );
++        update_menu_bar_layout( hwnd, rect.right - rect.left, rect.left, rect.top );
++    }
+ }
+ 
+ void track_mouse_menu_bar( HWND hwnd, INT ht, int x, int y )

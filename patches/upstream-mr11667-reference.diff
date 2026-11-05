@@ -1,0 +1,221 @@
+diff --git a/dlls/user32/tests/menu.c b/dlls/user32/tests/menu.c
+index 6862f13c6b16424b523eb1ed14b2360b0274defe..bc5a651d87896dd67761a396ab46192813a0823d 100644
+--- a/dlls/user32/tests/menu.c
++++ b/dlls/user32/tests/menu.c
+@@ -54,6 +54,10 @@ static LRESULT WINAPI menu_check_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LP
+ static BOOL bMenuVisible;
+ static INT popmenu;
+ static BOOL got_input;
++static BOOL rebuild_menu_bar;
++static BOOL check_popup_pos;
++static BOOL initmenu_rebuilt;
++static INT nccalcsize_calls_after_rebuild;
+ static HMENU hMenus[4];
+ 
+ #define MOD_SIZE 10
+@@ -2191,6 +2195,8 @@ static struct menu_mouse_tests_s {
+     WORD wVk[5]; /* keys */
+     BOOL bMenuVisible;
+     BOOL _todo_wine;
++    BOOL rebuild_menu_bar; /* during WM_INITMENU */
++    BOOL check_popup_pos; /* check that the popup menu is not covering the menu bar */
+ } menu_tests[] = {
+     /* for each test, send keys or clicks and check for menu visibility */
+     { INPUT_KEYBOARD, {{0}}, {VK_MENU, 0}, TRUE, FALSE }, /* test 0 */
+@@ -2225,6 +2231,14 @@ static struct menu_mouse_tests_s {
+     { INPUT_MOUSE, {{1, 0}, {2, 0}, {0}}, {0}, TRUE, FALSE },
+     { INPUT_MOUSE, {{3, 1}, {0}}, {0}, TRUE, FALSE },
+     { INPUT_MOUSE, {{1, 1}, {0}}, {0}, FALSE, FALSE },
++
++    /* rebuild the menu bar inside WM_INITMENU, like Reason does */
++    { INPUT_MOUSE, {{1, 0}, {0}}, {0}, TRUE, FALSE, TRUE },
++    { INPUT_MOUSE, {{2, 1}, {0}}, {0}, FALSE, FALSE, FALSE },
++    { INPUT_KEYBOARD, {{0}}, {VK_MENU, 0}, TRUE, FALSE, TRUE },
++    { INPUT_KEYBOARD, {{0}}, {VK_ESCAPE, 0}, FALSE, FALSE, FALSE },
++    { INPUT_KEYBOARD, {{0}}, {VK_MENU, 'M', 0}, TRUE, FALSE, TRUE, TRUE },
++    { INPUT_KEYBOARD, {{0}}, {VK_ESCAPE, VK_ESCAPE, 0}, FALSE, FALSE, FALSE },
+     { -1 }
+ };
+ 
+@@ -2267,6 +2281,34 @@ static BOOL click_menu(HANDLE hWnd, struct menu_item_pair_s *mi)
+     return ret;
+ }
+ 
++static void check_popup_below_menu_bar( HWND hwnd )
++{
++    RECT menu_bar_rect, popup_rect;
++    HWND popup;
++    int elapsed;
++    BOOL ret;
++    static char popup_menu_class[] = "#32768";
++
++    for (elapsed = 0; elapsed <= 200; elapsed += 20)
++    {
++        popup = NULL;
++        while ((popup = FindWindowExA( NULL, popup, popup_menu_class, NULL )) && !IsWindowVisible( popup ))
++            ;
++
++        if (popup) break;
++        Sleep( 20 );
++    }
++
++    ok( popup != NULL, "popup menu window not found\n" );
++    if (!popup) return;
++
++    ret = GetMenuItemRect( hwnd, GetMenu( hwnd ), 0, &menu_bar_rect );
++    ok( ret, "GetMenuItemRect failed, error %ld\n", GetLastError() );
++    GetWindowRect( popup, &popup_rect );
++    ok( popup_rect.top >= menu_bar_rect.bottom - 1, "popup %s overlaps the menu bar %s\n",
++        wine_dbgstr_rect( &popup_rect ), wine_dbgstr_rect( &menu_bar_rect ) );
++}
++
+ static DWORD WINAPI test_menu_input_thread(LPVOID lpParameter)
+ {
+     int i, j;
+@@ -2280,6 +2322,10 @@ static DWORD WINAPI test_menu_input_thread(LPVOID lpParameter)
+         int elapsed;
+ 
+         got_input = i && menu_tests[i-1].bMenuVisible;
++        rebuild_menu_bar = menu_tests[i].rebuild_menu_bar;
++        check_popup_pos = menu_tests[i].check_popup_pos;
++        initmenu_rebuilt = FALSE;
++        nccalcsize_calls_after_rebuild = 0;
+ 
+         if (menu_tests[i].type == INPUT_KEYBOARD)
+             for (j = 0; menu_tests[i].wVk[j] != 0; j++)
+@@ -2322,6 +2368,8 @@ static DWORD WINAPI test_menu_input_thread(LPVOID lpParameter)
+ 
+         todo_wine_if (menu_tests[i]._todo_wine)
+             ok(menu_tests[i].bMenuVisible == bMenuVisible, "test %d\n", i);
++
++        if (menu_tests[i].check_popup_pos) check_popup_below_menu_bar( hWnd );
+     }
+     return 0;
+ }
+@@ -2338,10 +2386,38 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam,
+         case WM_ENTERMENULOOP:
+             bMenuVisible = TRUE;
+             break;
++        case WM_INITMENU:
++            if (rebuild_menu_bar)
++            {
++                hmenu = GetMenu(hWnd);
++                while (GetMenuItemCount(hmenu) > 0)
++                    RemoveMenu(hmenu, 0, MF_BYPOSITION);
++
++                AppendMenuA(hmenu, MF_STRING|MF_POPUP, (UINT_PTR)hMenus[2], "&Menu");
++                AppendMenuA(hmenu, MF_STRING, 0, "&Enabled");
++                AppendMenuA(hmenu, MF_STRING|MF_DISABLED, 0, "&Disabled");
++                initmenu_rebuilt = TRUE;
++            }
++            break;
++        case WM_NCCALCSIZE:
++            if (initmenu_rebuilt)
++                nccalcsize_calls_after_rebuild++;
++            
++            return DefWindowProcA( hWnd, msg, wParam, lParam );
+         case WM_INITMENUPOPUP:
+         case WM_UNINITMENUPOPUP:
+         case WM_EXITMENULOOP:
++            break;
+         case WM_MENUSELECT:
++            /* the selected bar item must have a valid (non-empty) rect, esp. after a rebuild via WM_INITMENU */
++            /* skip when checking the popup position because GetMenuItemRect will recompute the layout */
++            if (rebuild_menu_bar && !check_popup_pos && (HMENU)lParam == GetMenu(hWnd) && LOWORD(wParam) != 0xffff)
++            {
++                RECT rect;
++                BOOL success = GetMenuItemRect(hWnd, (HMENU)lParam, LOWORD(wParam), &rect);
++                ok(success && !IsRectEmpty(&rect), "selected menu bar item %u has empty rect\n", LOWORD(wParam));
++                ok(!nccalcsize_calls_after_rebuild, "Received %d WM_NCCALCSIZE messages after WM_INITMENU rebuilt the menu bar\n", nccalcsize_calls_after_rebuild);
++            }
+             break;
+ 
+         case WM_KEYDOWN:
+diff --git a/dlls/win32u/menu.c b/dlls/win32u/menu.c
+index a700f44af78befb59cad46b20c3d6d175d344b3f..926ab9f677559e8ed617cc59e29e1b70619e97eb 100644
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -2221,21 +2221,31 @@ static void calc_menu_bar_size( HDC hdc, RECT *rect, struct menu *menu, HWND own
+     }
+ }
+ 
+-UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y )
++static void update_menu_bar_layout( HWND hwnd, UINT width, INT org_x, INT org_y )
+ {
+     struct menu *menu;
+     RECT rect_bar;
+     HDC hdc;
+ 
+-    TRACE( "hwnd %p, width %d, at (%d, %d).\n", hwnd, width, org_x, org_y );
+-
+-    if (!(menu = unsafe_menu_ptr( get_menu( hwnd )))) return 0;
++    if (!(menu = unsafe_menu_ptr( get_menu( hwnd )))) return;
+ 
+     hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_WINDOW );
+     NtGdiSelectFont( hdc, get_menu_font(FALSE));
+     SetRect( &rect_bar, org_x, org_y, org_x + width, org_y + get_system_metrics( SM_CYMENU ));
+     calc_menu_bar_size( hdc, &rect_bar, menu, hwnd );
+     NtUserReleaseDC( hwnd, hdc );
++}
++
++UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y )
++{
++    struct menu *menu;
++
++    TRACE( "hwnd %p, width %d, at (%d, %d).\n", hwnd, width, org_x, org_y );
++
++    update_menu_bar_layout( hwnd, width, org_x, org_y );
++
++    if (!(menu = unsafe_menu_ptr( get_menu( hwnd )))) return 0;
++
+     return menu->Height;
+ }
+ 
+@@ -4425,6 +4435,28 @@ static BOOL exit_tracking( HWND hwnd, BOOL is_popup )
+     return TRUE;
+ }
+ 
++static void ensure_menu_bar_layout( HWND hwnd, HMENU handle )
++{
++    struct menu *menu;
++    RECT rect;
++
++    /* Nothing to do if we don't get the menu */
++    if (!(menu = grab_menu_ptr( handle )))
++        return;
++
++    rect = menu->items_rect;
++    /* Nothing to do if the menu height is non-zero or the items_rect is empty */
++    if (menu->Height || IsRectEmpty( &rect ))
++    {
++        release_menu_ptr( menu );
++        return;
++    }
++
++    release_menu_ptr( menu );
++    /* A menu bar with zero height but non-empty items_rect needs updating */
++    update_menu_bar_layout( hwnd, rect.right - rect.left, rect.left, rect.top );
++}
++
+ void track_mouse_menu_bar( HWND hwnd, INT ht, int x, int y )
+ {
+     HMENU handle = ht == HTSYSMENU ? get_win_sys_menu( hwnd ) : get_menu( hwnd );
+@@ -4439,6 +4471,9 @@ void track_mouse_menu_bar( HWND hwnd, INT ht, int x, int y )
+ 
+         /* fetch the window menu again, it may have changed */
+         handle = ht == HTSYSMENU ? get_win_sys_menu( hwnd ) : get_menu( hwnd );
++        if (ht != HTSYSMENU)
++            ensure_menu_bar_layout( hwnd, handle );
++
+         track_menu( handle, flags, x, y, hwnd, NULL );
+         exit_tracking( hwnd, FALSE );
+     }
+@@ -4473,6 +4508,8 @@ void track_keyboard_menu_bar( HWND hwnd, UINT wparam, WCHAR ch )
+ 
+     /* fetch the window menu again, it may have changed */
+     menu = (wparam & HTSYSMENU) ? get_win_sys_menu( hwnd ) : get_menu( hwnd );
++    if (!(wparam & HTSYSMENU))
++        ensure_menu_bar_layout( hwnd, menu );
+ 
+     if (ch && ch != ' ')
+     {
